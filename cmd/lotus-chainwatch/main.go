@@ -1,17 +1,21 @@
 package main
 
 import (
-	"fmt"
+	"database/sql"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 
-	logging "github.com/ipfs/go-log/v2"
-	"github.com/urfave/cli/v2"
+	_ "github.com/lib/pq"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/lotus/build"
 	lcli "github.com/filecoin-project/lotus/cli"
+	logging "github.com/ipfs/go-log/v2"
+	"github.com/urfave/cli/v2"
+
+	"github.com/filecoin-project/lotus/cmd/lotus-chainwatch/processor"
+	"github.com/filecoin-project/lotus/cmd/lotus-chainwatch/syncer"
 )
 
 var log = logging.Logger("chainwatch")
@@ -25,8 +29,8 @@ func main() {
 	log.Info("Starting chainwatch")
 
 	local := []*cli.Command{
-		runCmd,
 		dotCmd,
+		runCmd,
 	}
 
 	app := &cli.App{
@@ -85,22 +89,26 @@ var runCmd = &cli.Command{
 
 		maxBatch := cctx.Int("max-batch")
 
-		st, err := openStorage(cctx.String("db"))
+		db, err := sql.Open("postgres", cctx.String("db"))
 		if err != nil {
 			return err
 		}
-		defer st.close() //nolint:errcheck
+		defer func() {
+			if err := db.Close(); err != nil {
+				log.Errorw("Failed to close database", "error", err)
+			}
+		}()
 
-		runSyncer(ctx, api, st, maxBatch)
-
-		h, err := newHandler(api, st)
-		if err != nil {
-			return xerrors.Errorf("handler setup: %w", err)
+		if err := db.Ping(); err != nil {
+			return xerrors.Errorf("Database failed to respond to ping (is it online?): %w", err)
 		}
+		db.SetMaxOpenConns(1350)
 
-		http.Handle("/", h)
+		sync := syncer.NewSyncer(db, api)
+		sync.Start(ctx)
 
-		fmt.Printf("Open http://%s\n", cctx.String("front"))
+		proc := processor.NewProcessor(db, api, maxBatch)
+		proc.Start(ctx)
 
 		go func() {
 			<-ctx.Done()
